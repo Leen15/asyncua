@@ -2,20 +2,17 @@
 from __future__ import annotations
 
 import logging
+from decimal import Decimal
 from typing import Any, Union
 
+import homeassistant.helpers.config_validation as cv
 import voluptuous as vol
-
 from homeassistant.components.sensor import SensorEntity
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import ConfigEntryError
-import homeassistant.helpers.config_validation as cv
 from homeassistant.helpers.config_validation import PLATFORM_SCHEMA
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
-from homeassistant.helpers.typing import (
-    ConfigType,
-    DiscoveryInfoType,
-)
+from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from . import AsyncuaCoordinator
@@ -33,11 +30,14 @@ from .const import (
 
 _LOGGER = logging.getLogger(__name__)
 
+# NOTE:
+# - state_class is optional. If you set a default here, string sensors would start
+#   with a numeric state_class and then lose it at runtime, which triggers Repairs.
 NODE_SCHEMA = {
     CONF_NODES: [
         {
             vol.Optional(CONF_NODE_DEVICE_CLASS): cv.string,
-            vol.Optional(CONF_NODE_STATE_CLASS, default="measurement"): cv.string,
+            vol.Optional(CONF_NODE_STATE_CLASS): cv.string,
             vol.Optional(CONF_NODE_UNIT_OF_MEASUREMENT): cv.string,
             vol.Optional(CONF_NODE_UNIQUE_ID): cv.string,
             vol.Required(CONF_NODE_ID): cv.string,
@@ -59,43 +59,44 @@ async def async_setup_platform(
     async_add_entities: AddEntitiesCallback,
     discovery_info: DiscoveryInfoType | None = None,
 ) -> None:
-    """Set up asyncua_sensor coordinator_nodes."""
+    """Set up asyncua sensor platform."""
 
     # {"hub": [node0, node1]}
     # where node0 equals {"name": "node0", "unique_id": "node0", ...}.
 
     coordinator_nodes: dict[str, list[dict[str, str]]] = {}
     coordinators: dict[str, AsyncuaCoordinator] = {}
-    asyncua_sensors: list = []
+    asyncua_sensors: list[AsyncuaSensor] = []
 
     # Compile dictionary of {hub: [node0, node1, ...]}
-    for _idx_node, val_node in enumerate(config[CONF_NODES]):
-        if val_node[CONF_NODE_HUB] not in coordinator_nodes.keys():
-            coordinator_nodes[val_node[CONF_NODE_HUB]] = []
-        coordinator_nodes[val_node[CONF_NODE_HUB]].append(val_node)
+    for val_node in config[CONF_NODES]:
+        coordinator_nodes.setdefault(val_node[CONF_NODE_HUB], []).append(val_node)
 
-    for key_coordinator, val_coordinator in coordinator_nodes.items():
+    for hub_name, hub_nodes in coordinator_nodes.items():
         # Get the respective asyncua coordinator
-        if key_coordinator not in hass.data[DOMAIN].keys():
+        if hub_name not in hass.data[DOMAIN]:
             raise ConfigEntryError(
-                f"Asyncua hub {key_coordinator} not found. Specify a valid asyncua hub in the configuration."
+                f"Asyncua hub {hub_name} not found. Specify a valid asyncua hub in the configuration."
             )
-        coordinators[key_coordinator] = hass.data[DOMAIN][key_coordinator]
-        coordinators[key_coordinator].add_sensors(sensors=val_coordinator)
+
+        coordinators[hub_name] = hass.data[DOMAIN][hub_name]
+        coordinators[hub_name].add_sensors(sensors=hub_nodes)
 
         # Create sensors with injecting respective asyncua coordinator
-        for _idx_sensor, val_sensor in enumerate(val_coordinator):
+        for node_cfg in hub_nodes:
             asyncua_sensors.append(
                 AsyncuaSensor(
-                    coordinator=coordinators[key_coordinator],
-                    name=val_sensor[CONF_NODE_NAME],
-                    unique_id=val_sensor.get(CONF_NODE_UNIQUE_ID),
-                    hub=val_sensor[CONF_NODE_HUB],
-                    node_id=val_sensor[CONF_NODE_ID],
-                    device_class=val_sensor.get(CONF_NODE_DEVICE_CLASS),
-                    unit_of_measurement=val_sensor.get(CONF_NODE_UNIT_OF_MEASUREMENT),
+                    coordinator=coordinators[hub_name],
+                    name=node_cfg[CONF_NODE_NAME],
+                    unique_id=node_cfg.get(CONF_NODE_UNIQUE_ID),
+                    hub=node_cfg[CONF_NODE_HUB],
+                    node_id=node_cfg[CONF_NODE_ID],
+                    device_class=node_cfg.get(CONF_NODE_DEVICE_CLASS),
+                    unit_of_measurement=node_cfg.get(CONF_NODE_UNIT_OF_MEASUREMENT),
+                    state_class=node_cfg.get(CONF_NODE_STATE_CLASS),
                 )
             )
+
     async_add_entities(new_entities=asyncua_sensors)
 
 
@@ -110,28 +111,41 @@ class AsyncuaSensor(CoordinatorEntity[AsyncuaCoordinator], SensorEntity):
         node_id: str,
         device_class: Any,
         unique_id: Union[str, None] = None,
-        state_class: str = "measurement",
+        state_class: Union[str, None] = None,
         precision: int = 2,
         unit_of_measurement: Union[str, None] = None,
     ) -> None:
         """Initialize the entity."""
         super().__init__(coordinator=coordinator)
+
         self._attr_name = name
         self._attr_unique_id = (
             unique_id if unique_id is not None else f"{DOMAIN}.{hub}.{node_id}"
         )
-        self._attr_available = False
+
         self._attr_device_class = device_class
         self._attr_native_unit_of_measurement = unit_of_measurement
         self._attr_native_value = None
+
+        # Keep a copy of the configured metadata so we can restore it after reconnects.
+        self._configured_state_class = state_class
+        self._configured_precision = precision
+
         self._attr_state_class = state_class
         self._attr_suggested_display_precision = precision
-        # self._attr_unit_of_measurement = unit_of_measurement
+
+        self._attr_available = True
         self._hub = hub
         self._node_id = node_id
-        self._sensor_data = self._parse_coordinator_data(
-            coordinator_data=coordinator.data
-        )
+
+        # Initialize from any existing coordinator data (if any)
+        initial_value = self._parse_coordinator_data(coordinator_data=coordinator.data)
+        if initial_value is None:
+            self._attr_available = False
+        else:
+            self._attr_available = True
+            self._attr_native_value = initial_value
+            self._apply_metadata_for_value(initial_value)
 
     @property
     def unique_id(self) -> str | None:
@@ -143,10 +157,7 @@ class AsyncuaSensor(CoordinatorEntity[AsyncuaCoordinator], SensorEntity):
         """Return the node address provided by the OPCUA server."""
         return self._node_id
 
-    def _parse_coordinator_data(
-        self,
-        coordinator_data: dict[str, Any],
-    ) -> Any:
+    def _parse_coordinator_data(self, coordinator_data: dict[str, Any]) -> Any:
         """Parse the value from the mapped coordinator."""
         if self._attr_name is None:
             raise ConfigEntryError(
@@ -154,10 +165,30 @@ class AsyncuaSensor(CoordinatorEntity[AsyncuaCoordinator], SensorEntity):
             )
         return coordinator_data.get(self._attr_name)
 
+    def _apply_metadata_for_value(self, value: Any) -> None:
+        """Apply state_class/precision depending on the native value type."""
+        # Home Assistant: if state_class != None, sensor is treated as numeric.
+        # Keep state_class only for numeric values; drop it for strings/other types.
+        if isinstance(value, (int, float, Decimal)) and not isinstance(value, bool):
+            self._attr_state_class = self._configured_state_class
+            self._attr_suggested_display_precision = self._configured_precision
+        else:
+            self._attr_state_class = None
+            self._attr_suggested_display_precision = None
+
     @callback
     def _handle_coordinator_update(self) -> None:
         """Handle update of the data."""
-        self._attr_native_value = self._parse_coordinator_data(
-            coordinator_data=self.coordinator.data,
-        )
+        value = self._parse_coordinator_data(coordinator_data=self.coordinator.data)
+
+        # PLC down / value missing: mark unavailable but DO NOT touch metadata like state_class.
+        if value is None:
+            self._attr_available = False
+            self.async_write_ha_state()
+            return
+
+        self._attr_available = True
+        self._attr_native_value = value
+        self._apply_metadata_for_value(value)
+
         self.async_write_ha_state()
