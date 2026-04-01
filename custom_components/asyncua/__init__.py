@@ -324,7 +324,15 @@ class AsyncuaCoordinator(DataUpdateCoordinator):
 
     async def _async_update_data(self) -> dict[str, Any]:
         """Update the state of the sensor."""
-        vals = await self.hub.get_values(node_key_pair=self.node_key_pair)
+        try:
+            vals = await self.hub.get_values(node_key_pair=self.node_key_pair)
+        except (OSError, socket.gaierror, asyncio.TimeoutError) as err:
+            # PLC offline / network error: return empty data so entities become unavailable.
+            # Log at debug to avoid flooding.
+            _LOGGER.debug("OPC UA update failed (hub=%s): %s", self.name, err)
+            return {}
+
         if not self.hub.connected:
             return {}
+
         return {**vals} if vals is not None else {}
