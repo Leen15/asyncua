@@ -152,6 +152,7 @@ class OpcuaHub:
         username: str | None = None,
         password: str | None = None,
         timeout: float = 4,
+        operation_timeout: float = 15,
     ) -> None:
         """Initialize the OPCUA hub."""
         self._hub_name = hub_name
@@ -159,6 +160,9 @@ class OpcuaHub:
         self._username = username
         self._password = password
         self._timeout = timeout
+        # Upper bound for a full connect + read/write + disconnect cycle.
+        # Prevents a half-open TCP connection from hanging the coordinator forever.
+        self._operation_timeout = operation_timeout
         self._connected: bool = False
         self.device_info = DeviceInfo(
             configuration_url=hub_url,
@@ -213,30 +217,48 @@ class OpcuaHub:
             data = {}
             try:
                 start_time = time.perf_counter()
-                async with self.client:
-                    data = await func(self, *args, **kwargs)
-                    self.packet_count += 1
-                    self.elapsed_time = time.perf_counter() - start_time
-                    self.connected = True
-            except RuntimeError as e:
-                _LOGGER.error(
-                    "RuntimeError while connecting to %s @ %s: %s",
-                    self.hub_name,
-                    self.hub_url,
-                    e,
-                )
-                self.connected = False
-            except TimeoutError as e:
-                _LOGGER.error(
-                    "Timeout while connecting to %s @ %s: %s",
+                # Hard upper bound on the whole transaction. If the socket is
+                # half-open (PLC unreachable after a network glitch), connect or
+                # disconnect could otherwise hang forever and freeze the
+                # coordinator until Home Assistant is restarted.
+                async with asyncio.timeout(self._operation_timeout):
+                    async with self.client:
+                        data = await func(self, *args, **kwargs)
+                        self.packet_count += 1
+                        self.elapsed_time = time.perf_counter() - start_time
+                        self.connected = True
+            except (TimeoutError, asyncio.TimeoutError) as e:
+                _LOGGER.warning(
+                    "Timeout while communicating with %s @ %s: %s",
                     self.hub_name,
                     self.hub_url,
                     e,
                 )
                 self.connected = False
             except ConnectionRefusedError as e:
-                _LOGGER.error(
+                _LOGGER.warning(
                     "Connection Refused Error while connecting to %s @ %s: %s",
+                    self.hub_name,
+                    self.hub_url,
+                    e,
+                )
+                self.connected = False
+            except (OSError, RuntimeError) as e:
+                # Covers socket errors (ConnectionReset, BrokenPipe, gaierror, ...)
+                # and asyncua runtime/protocol errors. Keep the integration alive
+                # and let it reconnect on the next scan instead of dying.
+                _LOGGER.warning(
+                    "Error while communicating with %s @ %s: %s",
+                    self.hub_name,
+                    self.hub_url,
+                    e,
+                )
+                self.connected = False
+            except Exception as e:  # noqa: BLE001
+                # Last-resort guard: never let an unexpected error from the
+                # asyncua client propagate and stall the coordinator.
+                _LOGGER.exception(
+                    "Unexpected error while communicating with %s @ %s: %s",
                     self.hub_name,
                     self.hub_url,
                     e,
@@ -324,11 +346,14 @@ class AsyncuaCoordinator(DataUpdateCoordinator):
 
     async def _async_update_data(self) -> dict[str, Any]:
         """Update the state of the sensor."""
+        # OpcuaHub.get_values already traps connection/protocol errors and
+        # returns an empty dict on failure, so we only guard against unexpected
+        # errors here to keep the coordinator alive.
         try:
             vals = await self.hub.get_values(node_key_pair=self.node_key_pair)
-        except (OSError, socket.gaierror, asyncio.TimeoutError) as err:
-            # PLC offline / network error: return empty data so entities become unavailable.
-            # Log at debug to avoid flooding.
+        except OSError as err:
+            # PLC offline / network error: return empty data so entities become
+            # unavailable. Log at debug to avoid flooding.
             _LOGGER.debug("OPC UA update failed (hub=%s): %s", self.name, err)
             return {}
 
